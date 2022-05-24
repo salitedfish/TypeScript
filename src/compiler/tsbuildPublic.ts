@@ -146,6 +146,8 @@ namespace ts {
         /*@internal*/ getUpToDateStatusOfProject(project: string): UpToDateStatus;
         /*@internal*/ invalidateProject(configFilePath: ResolvedConfigFilePath, reloadLevel?: ConfigFileProgramReloadLevel): void;
         /*@internal*/ close(): void;
+        /*@internal*/ times(): Map<number>;
+        /*@internal*/ clearTimes(): void;
     }
 
     /**
@@ -239,6 +241,9 @@ namespace ts {
         readonly compilerHost: CompilerHost;
         readonly moduleResolutionCache: ModuleResolutionCache | undefined;
         readonly typeReferenceDirectiveResolutionCache: TypeReferenceDirectiveResolutionCache | undefined;
+
+        readonly time: <U extends (...args: any) => any>(name: string, fn: U, ...args: Parameters<U>) => ReturnType<U>;
+        readonly times: Map<number>;
 
         // Mutable state
         buildOrder: AnyBuildOrder | undefined;
@@ -344,9 +349,24 @@ namespace ts {
             watchFile,
             watchDirectory,
             writeLog,
+
+            times: new Map(),
+            time: options.extendedDiagnostics || options.diagnostics ? withTime : withTimePassThrough,
         };
 
         return state;
+
+        function withTime<T extends (...args: any) => any>(name: string, fn: T, ...args: Parameters<T>): ReturnType<T> {
+            const start = timestamp();
+            const result = fn(...args);
+            const end = timestamp();
+            state.times.set(name, (state.times.get(name) ?? 0) + end - start);
+            return result;
+        }
+    }
+
+    function withTimePassThrough<U extends (...args: any) => any>(_name: string, fn: U, ...args: Parameters<U>): ReturnType<U> {
+        return fn(...args);
     }
 
     function toPath(state: SolutionBuilderState, fileName: string) {
@@ -432,7 +452,7 @@ namespace ts {
 
             temporaryMarks.set(projPath, true);
             circularityReportStack.push(configFileName);
-            const parsed = parseConfigFile(state, configFileName, projPath);
+            const parsed = state.time("parseConfigFile", parseConfigFile, state, configFileName, projPath);
             if (parsed && parsed.projectReferences) {
                 for (const ref of parsed.projectReferences) {
                     const resolvedRefPath = resolveProjectName(state, ref.path);
@@ -961,7 +981,7 @@ namespace ts {
             let anyDtsChanged = false;
             const emitterDiagnostics = createDiagnosticCollection();
             const emittedOutputs = new Map<Path, string>();
-            outputFiles.forEach(({ name, text, writeByteOrderMark }) => {
+            state.time("outputFilesWrite", () => outputFiles.forEach(({ name, text, writeByteOrderMark }) => {
                 let priorChangeTime: Date | undefined;
                 if (!anyDtsChanged && isDeclarationFileName(name)) {
                     // Check for unchanged .d.ts files
@@ -979,7 +999,7 @@ namespace ts {
                 if (priorChangeTime !== undefined) {
                     newestDeclarationFileContentChangedTime = newer(priorChangeTime, newestDeclarationFileContentChangedTime);
                 }
-            });
+            }));
 
             finishEmit(
                 emitterDiagnostics,
@@ -1037,7 +1057,7 @@ namespace ts {
             }
 
             // Update time stamps for rest of the outputs
-            const newestDeclarationFileContentChangedTime = updateOutputTimestampsWorker(state, config, priorNewestUpdateTime, Diagnostics.Updating_unchanged_output_timestamps_of_project_0, emittedOutputs);
+            const newestDeclarationFileContentChangedTime = state.time("updateOutputTimestampsWorker", updateOutputTimestampsWorker, state, config, priorNewestUpdateTime, Diagnostics.Updating_unchanged_output_timestamps_of_project_0, emittedOutputs);
             state.diagnostics.delete(projectPath);
             state.projectStatus.set(projectPath, {
                 type: UpToDateStatusType.UpToDate,
@@ -1195,7 +1215,7 @@ namespace ts {
                 reportBuildQueue(state, buildOrder);
             }
 
-            const config = parseConfigFile(state, project, projectPath);
+            const config = state.time("parseConfigFile", parseConfigFile, state, project, projectPath);
             if (!config) {
                 reportParseConfigFileDiagnostic(state, projectPath);
                 projectPendingBuild.delete(projectPath);
@@ -1217,7 +1237,7 @@ namespace ts {
                 watchPackageJsonFiles(state, project, projectPath, config);
             }
 
-            const status = getUpToDateStatus(state, config, projectPath);
+            const status = state.time("getUpToDateStatus", getUpToDateStatus, state, config, projectPath);
             if (!options.force) {
                 if (status.type === UpToDateStatusType.UpToDate) {
                     verboseReportProjectStatus(state, project, status);
@@ -1325,11 +1345,11 @@ namespace ts {
         }
     }
 
-    function getOldProgram<T extends BuilderProgram>({ options, builderPrograms, compilerHost }: SolutionBuilderState<T>, proj: ResolvedConfigFilePath, parsed: ParsedCommandLine) {
-        if (options.force) return undefined;
-        const value = builderPrograms.get(proj);
+    function getOldProgram<T extends BuilderProgram>(state: SolutionBuilderState<T>, proj: ResolvedConfigFilePath, parsed: ParsedCommandLine) {
+        if (state.options.force) return undefined;
+        const value = state.builderPrograms.get(proj);
         if (value) return value;
-        return readBuilderProgram(parsed.options, compilerHost) as any as T;
+        return state.time("readBuilderProgram", readBuilderProgram, parsed.options, state.compilerHost) as any as T;
     }
 
     function afterProgramDone<T extends BuilderProgram>(
@@ -1468,7 +1488,7 @@ namespace ts {
                 usesPrepend = usesPrepend || !!(ref.prepend);
                 const resolvedRef = resolveProjectReferencePath(ref);
                 const resolvedRefPath = toResolvedConfigFilePath(state, resolvedRef);
-                const refStatus = getUpToDateStatus(state, parseConfigFile(state, resolvedRef, resolvedRefPath), resolvedRefPath);
+                const refStatus = state.time("getUpToDateStatus", getUpToDateStatus, state, state.time("parseConfigFile", parseConfigFile, state, resolvedRef, resolvedRefPath), resolvedRefPath);
 
                 // Its a circular reference ignore the status of this project
                 if (refStatus.type === UpToDateStatusType.ComputingUpstream ||
@@ -1557,7 +1577,7 @@ namespace ts {
             state.buildInfoChecked.set(resolvedPath, true);
             const buildInfoPath = getTsBuildInfoEmitOutputFilePath(project.options);
             if (buildInfoPath) {
-                const value = state.readFileWithCache(buildInfoPath);
+                const value = state.time("buildInfoRead", () => state.readFileWithCache(buildInfoPath));
                 const buildInfo = value && getBuildInfo(value);
                 if (buildInfo && (buildInfo.bundle || buildInfo.program) && buildInfo.version !== version) {
                     return {
@@ -1635,7 +1655,7 @@ namespace ts {
         if (state.options.dry) {
             return reportStatus(state, Diagnostics.A_non_dry_build_would_update_timestamps_for_output_of_project_0, proj.options.configFilePath!);
         }
-        const priorNewestUpdateTime = updateOutputTimestampsWorker(state, proj, minimumDate, Diagnostics.Updating_output_timestamps_of_project_0);
+        const priorNewestUpdateTime = state.time("updateOutputTimestampsWorker", updateOutputTimestampsWorker, state, proj, minimumDate, Diagnostics.Updating_output_timestamps_of_project_0);
         state.projectStatus.set(resolvedPath, {
             type: UpToDateStatusType.UpToDate,
             newestDeclarationFileContentChangedTime: priorNewestUpdateTime,
@@ -1662,7 +1682,7 @@ namespace ts {
             const nextProjectPath = toResolvedConfigFilePath(state, nextProject);
             if (state.projectPendingBuild.has(nextProjectPath)) continue;
 
-            const nextProjectConfig = parseConfigFile(state, nextProject, nextProjectPath);
+            const nextProjectConfig = state.time("parseConfigFile", parseConfigFile, state, nextProject, nextProjectPath);
             if (!nextProjectConfig || !nextProjectConfig.projectReferences) continue;
             for (const ref of nextProjectConfig.projectReferences) {
                 const resolvedRefPath = resolveProjectName(state, ref.path);
@@ -1714,7 +1734,7 @@ namespace ts {
     }
 
     function build(state: SolutionBuilderState, project?: string, cancellationToken?: CancellationToken, writeFile?: WriteFileCallback, getCustomTransformers?: (project: string) => CustomTransformers, onlyReferences?: boolean): ExitStatus {
-        const buildOrder = getBuildOrderFor(state, project, onlyReferences);
+        const buildOrder = state.time("getBuildOrderFor", getBuildOrderFor, state, project, onlyReferences);
         if (!buildOrder) return ExitStatus.InvalidProject_OutputsSkipped;
 
         setupInitialBuild(state, cancellationToken);
@@ -1722,16 +1742,16 @@ namespace ts {
         let reportQueue = true;
         let successfulProjects = 0;
         while (true) {
-            const invalidatedProject = getNextInvalidatedProject(state, buildOrder, reportQueue);
+            const invalidatedProject = state.time("getNextInvalidatedProject", getNextInvalidatedProject, state, buildOrder, reportQueue);
             if (!invalidatedProject) break;
             reportQueue = false;
-            invalidatedProject.done(cancellationToken, writeFile, getCustomTransformers?.(invalidatedProject.project));
+            state.time("invalidatedProjectBuild", () => invalidatedProject.done(cancellationToken, writeFile, getCustomTransformers?.(invalidatedProject.project)));
             if (!state.diagnostics.has(invalidatedProject.projectPath)) successfulProjects++;
         }
 
         disableCache(state);
         reportErrorSummary(state, buildOrder);
-        startWatching(state, buildOrder);
+        state.time("startWatching", startWatching, state, buildOrder);
 
         return isCircularBuildOrder(buildOrder)
             ? ExitStatus.ProjectReferenceCycle_OutputsSkipped
@@ -1820,35 +1840,40 @@ namespace ts {
 
     function buildNextInvalidatedProject(state: SolutionBuilderState, changeDetected: boolean) {
         state.timerToBuildInvalidatedProject = undefined;
-        if (state.reportFileChangeDetected) {
-            state.reportFileChangeDetected = false;
-            state.projectErrorsReported.clear();
-            reportWatchStatus(state, Diagnostics.File_change_detected_Starting_incremental_compilation);
-        }
-        let projectsBuilt = 0;
-        const buildOrder = getBuildOrder(state);
-        const invalidatedProject = getNextInvalidatedProject(state, buildOrder, /*reportQueue*/ false);
-        if (invalidatedProject) {
-            invalidatedProject.done();
-            projectsBuilt++;
-            while (state.projectPendingBuild.size) {
-                // If already scheduled, skip
-                if (state.timerToBuildInvalidatedProject) return;
-                // Before scheduling check if the next project needs build
-                const info = getNextInvalidatedProjectCreateInfo(state, buildOrder, /*reportQueue*/ false);
-                if (!info) break; // Nothing to build any more
-                if (info.kind !== InvalidatedProjectKind.UpdateOutputFileStamps && (changeDetected || projectsBuilt === 5)) {
-                    // Schedule next project for build
-                    scheduleBuildInvalidatedProject(state, 100, /*changeDetected*/ false);
-                    return;
-                }
-                const project = createInvalidatedProjectWithInfo(state, info, buildOrder);
-                project.done();
-                if (info.kind !== InvalidatedProjectKind.UpdateOutputFileStamps) projectsBuilt++;
+        let buildOrder: AnyBuildOrder;
+        let callReportErrorSummary = false;
+        state.time("watchBuild", () => {
+            if (state.reportFileChangeDetected) {
+                state.reportFileChangeDetected = false;
+                state.projectErrorsReported.clear();
+                reportWatchStatus(state, Diagnostics.File_change_detected_Starting_incremental_compilation);
             }
-        }
-        disableCache(state);
-        reportErrorSummary(state, buildOrder);
+            let projectsBuilt = 0;
+            buildOrder = state.time("getBuildOrder", getBuildOrder, state);
+            const invalidatedProject = state.time("getNextInvalidatedProject", getNextInvalidatedProject, state, buildOrder, /*reportQueue*/ false);
+            if (invalidatedProject) {
+                state.time("invalidatedProjectBuild", () => invalidatedProject.done());
+                projectsBuilt++;
+                while (state.projectPendingBuild.size) {
+                    // If already scheduled, skip
+                    if (state.timerToBuildInvalidatedProject) return;
+                    // Before scheduling check if the next project needs build
+                    const info = state.time("getNextInvalidatedProjectCreateInfo", getNextInvalidatedProjectCreateInfo, state, buildOrder, /*reportQueue*/ false);
+                    if (!info) break; // Nothing to build any more
+                    if (info.kind !== InvalidatedProjectKind.UpdateOutputFileStamps && (changeDetected || projectsBuilt === 5)) {
+                        // Schedule next project for build
+                        scheduleBuildInvalidatedProject(state, 100, /*changeDetected*/ false);
+                        return;
+                    }
+                    const project = state.time("createInvalidatedProjectWithInfo", createInvalidatedProjectWithInfo, state, info, buildOrder);
+                    state.time("invalidatedProjectBuild", () => project.done());
+                    if (info.kind !== InvalidatedProjectKind.UpdateOutputFileStamps) projectsBuilt++;
+                }
+            }
+            disableCache(state);
+            callReportErrorSummary = true;
+        });
+        if (callReportErrorSummary) reportErrorSummary(state, buildOrder!);
     }
 
     function watchConfigFile(state: SolutionBuilderState, resolved: ResolvedConfigFileName, resolvedPath: ResolvedConfigFilePath, parsed: ParsedCommandLine | undefined) {
@@ -1991,7 +2016,7 @@ namespace ts {
     function createSolutionBuilderWorker<T extends BuilderProgram>(watch: boolean, hostOrHostWithWatch: SolutionBuilderHost<T> | SolutionBuilderWithWatchHost<T>, rootNames: readonly string[], options: BuildOptions, baseWatchOptions?: WatchOptions): SolutionBuilder<T> {
         const state = createSolutionBuilderState(watch, hostOrHostWithWatch, rootNames, options, baseWatchOptions);
         return {
-            build: (project, cancellationToken, writeFile, getCustomTransformers) => build(state, project, cancellationToken, writeFile, getCustomTransformers),
+            build: (project, cancellationToken, writeFile, getCustomTransformers) => state.time("build", build, state, project, cancellationToken, writeFile, getCustomTransformers),
             clean: project => clean(state, project),
             buildReferences: (project, cancellationToken, writeFile, getCustomTransformers) => build(state, project, cancellationToken, writeFile, getCustomTransformers, /*onlyReferences*/ true),
             cleanReferences: project => clean(state, project, /*onlyReferences*/ true),
@@ -2007,6 +2032,8 @@ namespace ts {
             },
             invalidateProject: (configFilePath, reloadLevel) => invalidateProject(state, configFilePath, reloadLevel || ConfigFileProgramReloadLevel.None),
             close: () => stopWatching(state),
+            times: () => state.times,
+            clearTimes: () => state.times.clear(),
         };
     }
 
